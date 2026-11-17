@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import os
+from collections import Counter
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -184,17 +185,28 @@ def test_index_scan_capacity_launches_and_scratch(device):
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
-            ]
+            ],
+            # Warm up the profiler as well as the kernels before measuring.
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
         ) as prof:
-            run()
-            torch.cuda.synchronize()
+            for _ in range(2):
+                run()
+                torch.cuda.synchronize()
+                prof.step()
+        # CUDA activities also include memory copies and memsets, which can
+        # depend on allocator state rather than the index scan's launch count.
         launches.append(
-            sum(
-                event.device_type == torch.autograd.DeviceType.CUDA
+            Counter(
+                event.name
                 for event in prof.events()
+                if event.device_type == torch.autograd.DeviceType.CUDA
+                and not event.name.startswith(("Memcpy", "Memset"))
             )
         )
-    assert launches[0] > 0 and launches[0] == launches[1]
+    assert launches[0] and launches[0] == launches[1], {
+        "small_only": launches[0] - launches[1],
+        "large_only": launches[1] - launches[0],
+    }
     assert (
         scratch[0]
         == scratch[1]
